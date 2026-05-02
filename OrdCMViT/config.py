@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import os
 
-
 @dataclass
 class DataConfig:
     # ── BCMID paths ────────────────────────────────────────────────────────────
@@ -34,16 +33,19 @@ class DataConfig:
     #   ViT-Small/16-384 is pretrained at this resolution → no positional interp needed.
     mm_size: int = 384
 
-    # Ultrasound: 224×224 — native ViT-Small/16 size
+    # Ultrasound: 384×384 — increased resolution for sharper CAM
+    #   Was 224×224 (224/16 = 14 patches), now 384×384 (384/16 = 24 patches).
+    #   Larger input resolution provides more spatial context for ViT.
     #   US lesions are generally larger relative to image area than mammo calcifications.
-    #   224 is appropriate; lesions typically span 10-30% of US image.
-    us_size: int = 224
+    #   384 is appropriate for better lesion visibility in CAM visualizations.
+    us_size: int = 384
 
     # ── Patch size ─────────────────────────────────────────────────────────────
     # Both modalities use patch_size=16:
     #   Mammo: 384/16=24 → 24×24=576 tokens. Patch = 16px = 4.2% width.
-    #   US:    224/16=14 → 14×14=196 tokens. Patch = 16px = 7.1% width.
-    # Chosen over patch=8 to reduce sequence length for 323-sample dataset.
+    #   US:    384/16=24 → 24×24=576 tokens. Patch = 16px = 4.2% width.
+    # Both resolutions now matched for improved cross-attention alignment.
+    # Chosen over patch=8 (would give 48×48=2304 tokens) to keep memory/compute reasonable for 323 samples.
     patch_size: int = 16
 
     # ── Dataset split ──────────────────────────────────────────────────────────
@@ -56,6 +58,13 @@ class DataConfig:
     batch_size: int = 8        # BCMID is small; accumulate gradient to effective=32
     num_workers: int = 4
     pin_memory: bool = True
+
+    # ── Debug / visualization ─────────────────────────────────────────────────
+    # When true the BCMIDDataset will save intermediate images at each
+    # preprocessing step (original, cropped, annotation removed, resized).
+    # Useful for ensuring cropping/annotation removal works correctly.
+    save_preproc: bool = False
+    debug_dir: str = "debug_images"  # root for saved debug images
 
     # ── Augmentation probabilities ─────────────────────────────────────────────
     # Strong augmentation is ESSENTIAL given only 226 training samples
@@ -91,10 +100,11 @@ class ModelConfig:
     # WHY ViT-Small, not ViT-Base:
     #   ViT-Base = 86M params. With 226 training samples → catastrophic overfitting.
     #   ViT-Small = 22M params, 12 layers, 384-dim, 6 heads → much safer.
-    #   vit_small_patch16_384: pretrained on ImageNet-21k at 384×384 → used for mammo
-    #   vit_small_patch16_224: pretrained on ImageNet-21k at 224×224 → used for US
+    #   Both modalities now use vit_small_patch16_384: pretrained on ImageNet-21k at 384×384
+    #   This increases US resolution from 224×224 to 384×384 for sharper CAM visualizations.
+    #   NOTE: If timm provides vit_small_patch8_384, use that instead for even finer patches.
     mm_backbone_name: str = "vit_small_patch16_384"   # timm model name
-    us_backbone_name: str = "vit_small_patch16_224"   # timm model name
+    us_backbone_name: str = "vit_small_patch16_384"   # timm model name (upgraded from patch16_224)
     embed_dim: int = 384              # ViT-Small feature dimension
     pretrained: bool = True
 
@@ -158,7 +168,7 @@ class TrainingConfig:
     # Differential learning rates:
     #   Backbone (unfrozen blocks): very small LR (pretrained features)
     #   Cross-attention + heads: larger LR (new parameters)
-    backbone_lr: float = 5e-6         # for unfrozen backbone blocks
+    backbone_lr: float = 5e-5         # for unfrozen backbone blocks
     new_layers_lr: float = 1e-4       # for cross-attention, heads
     weight_decay: float = 0.05        # AdamW standard weight decay
     betas: Tuple[float, float] = (0.9, 0.999)

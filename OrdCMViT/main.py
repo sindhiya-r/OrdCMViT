@@ -35,7 +35,9 @@ import os
 import sys
 import json
 import argparse
+import dataclasses
 import warnings
+import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import classification_report, confusion_matrix
@@ -57,8 +59,9 @@ from src.models.ordcmvit import OrdCMViT, OrdinalHead
 from src.losses.losses import TotalLoss
 from src.engine.trainer import Trainer, evaluate
 from src.utils.seed import set_seed, get_device
-from src.utils.metrics import compute_metrics, print_metrics
-from src.utils.visualization import generate_all_cams
+from src.utils.metrics import compute_metrics, print_metrics, cam_entropy, compute_ece, class_wise_analysis
+from src.utils.visualization import generate_all_cams, plot_training_history
+from src.utils import report_utils, analysis_utils
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,7 +72,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="OrdCMViT: BCMID Breast Cancer BI-RADS Grading")
 
     # Required
-    parser.add_argument("--data_root",   type=str, default="./BCMID",
+    # allow overriding via environment variable for convenience on clusters
+    default_data_root = os.environ.get("BCMID_ROOT", "./BCMID")
+    parser.add_argument("--data_root",   type=str, default=default_data_root,
                         help="Root directory of BCMID dataset")
     parser.add_argument("--labels_csv",  type=str, default="./BCMID/BCMID_labels.csv",
                         help="Path to BCMID_labels.csv")
@@ -113,6 +118,10 @@ def build_config(args) -> Config:
     # Re-create output dirs
     for d in ["checkpoints", "visualizations", "logs"]:
         os.makedirs(os.path.join(cfg.data.output_dir, d), exist_ok=True)
+    # Snapshot the full config so every run is reproducible
+    config_path = os.path.join(cfg.data.output_dir, "run_config.json")
+    with open(config_path, "w") as f:
+        json.dump(dataclasses.asdict(cfg), f, indent=2, default=str)
     return cfg
 
 
@@ -124,17 +133,17 @@ def build_config(args) -> Config:
 def run_test_evaluation(model, test_loader, device, cfg, loss_fn):
     """
     Full evaluation on held-out test set:
-      - Per-class accuracy
-      - QWK (Quadratic Weighted Kappa)
-      - AUC macro
+      - Per-class accuracy, QWK, AUC macro
       - Confusion matrix plot
       - Per-patient predictions CSV
+      - Embeddings for t-SNE visualization
     """
     model.eval()
     tc = cfg.training
     from torch.cuda.amp import autocast
 
     all_pids, all_preds, all_labels, all_probs = [], [], [], []
+    all_us_embeddings, all_mm_embeddings, all_fused_embeddings = [], [], []
 
     for batch in test_loader:
         us      = batch["us"].to(device)
@@ -143,7 +152,12 @@ def run_test_evaluation(model, test_loader, device, cfg, loss_fn):
         labels  = batch["label"].to(device)
 
         with autocast(enabled=tc.use_amp):
-            out  = model(us, mm)
+            # some model versions may not support `return_embeddings` argument
+            try:
+                out = model(us, mm, return_embeddings=True)
+            except TypeError:
+                # fall back to simpler forward signature
+                out = model(us, mm)
 
         preds = OrdinalHead.predict(out["main_logits"]).cpu()
         probs = torch.sigmoid(out["main_logits"]).cpu().numpy()
@@ -152,6 +166,20 @@ def run_test_evaluation(model, test_loader, device, cfg, loss_fn):
         all_preds.extend(preds.numpy().tolist())
         all_labels.extend(labels.cpu().numpy().tolist())
         all_probs.extend(probs.tolist())
+
+        # Collect embeddings for t-SNE (CLS tokens from each modality)
+        if "us_embeddings" in out:
+            all_us_embeddings.extend(out["us_embeddings"].cpu().numpy())
+        elif "us_cls" in out:
+            all_us_embeddings.extend(out["us_cls"].cpu().numpy())
+
+        if "mm_embeddings" in out:
+            all_mm_embeddings.extend(out["mm_embeddings"].cpu().numpy())
+        elif "mm_cls" in out:
+            all_mm_embeddings.extend(out["mm_cls"].cpu().numpy())
+
+        if "fused_embeddings" in out:
+            all_fused_embeddings.extend(out["fused_embeddings"].cpu().numpy())
 
     # ── Metrics ───────────────────────────────────────────────────────
     metrics = compute_metrics(all_labels, all_preds, all_probs)
@@ -196,11 +224,86 @@ def run_test_evaluation(model, test_loader, device, cfg, loss_fn):
     plt.close()
     print(f"Confusion matrix saved → {cm_path}")
 
+    # ── Advanced Analysis ──────────────────────────────────────────────────
+    print("\n" + "="*60)
+    print("ADVANCED ANALYSIS")
+    print("="*60)
+
+    # Hard example mining
+    hard_df = analysis_utils.mine_hard_examples(
+        all_pids, all_labels, all_preds, np.array(all_probs),
+        cfg.data.output_dir
+    )
+
+    # Calibration analysis
+    calib_analysis = analysis_utils.check_prediction_calibration(
+        all_labels, np.array(all_probs), n_bins=5
+    )
+
+    # Modality contribution
+    modality_analysis = analysis_utils.analyze_modality_contribution(
+        model, test_loader, device, cfg
+    )
+
+    # Class-wise error analysis
+    class_analysis = class_wise_analysis(all_labels, all_preds)
+    print("\n[Analysis] Class-wise Error Patterns:")
+    for trans, info in class_analysis["error_transitions"].items():
+        print(f"  {trans}: {info['count']} cases (severity: ±{info['severity_delta']})")
+
+    # Save comprehensive report
+    analysis_utils.save_run_report(
+        cfg.data.output_dir,
+        metrics,
+        calib_analysis,
+        modality_analysis,
+        hard_df,
+    )
+
+    # ── t-SNE Visualizations ──────────────────────────────────────────────
+    print("\n" + "="*60)
+    print("EMBEDDING VISUALIZATIONS")
+    print("="*60)
+
+    # Fused embeddings t-SNE
+    if len(all_fused_embeddings) > 0:
+        from src.utils.visualization import plot_tsne_embeddings
+        fused_emb_array = np.array(all_fused_embeddings)
+        print(f"[Plot] Fused embeddings shape: {fused_emb_array.shape}")
+        plot_tsne_embeddings(
+            fused_emb_array,
+            np.array(all_labels),
+            cfg.data.output_dir,
+            title="t-SNE of Fused Cross-Modal Embeddings"
+        )
+
+    # Per-modality embeddings t-SNE
+    if len(all_us_embeddings) > 0 and len(all_mm_embeddings) > 0:
+        from src.utils.visualization import plot_tsne_per_modality
+        us_emb_array = np.array(all_us_embeddings)
+        mm_emb_array = np.array(all_mm_embeddings)
+        print(f"[Plot] US embeddings shape: {us_emb_array.shape}")
+        print(f"[Plot] Mammo embeddings shape: {mm_emb_array.shape}")
+        plot_tsne_per_modality(
+            us_emb_array,
+            mm_emb_array,
+            np.array(all_labels),
+            cfg.data.output_dir
+        )
+    else:
+        print("[Plot] Embeddings not collected (model may not support return_embeddings)")
+
     # ── Save metrics JSON ──────────────────────────────────────────────
     metrics_path = os.path.join(cfg.data.output_dir, "test_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump({k: round(v, 6) for k, v in metrics.items() if isinstance(v, float)}, f, indent=2)
     print(f"Metrics JSON saved → {metrics_path}")
+
+    # ── Summarize run (tables & visualization paths) ───────────────────
+    try:
+        report_utils.summarize_run(cfg.data.output_dir, split="test", verbose=True)
+    except Exception as e:
+        print(f"Warning: could not generate run summary: {e}")
 
     return metrics
 
@@ -214,6 +317,12 @@ def main():
     args = parse_args()
     cfg  = build_config(args)
 
+    # sanity check for user to catch incorrect paths early
+    if not os.path.isdir(cfg.data.data_root):
+        print(f"ERROR: data_root does not exist: {cfg.data.data_root}")
+        print("Please set --data_root to the BCMID dataset location or export BCMID_ROOT env var.")
+        sys.exit(1)
+
     print("\n" + "="*60)
     print("OrdCMViT — Breast Cancer BI-RADS Grading (BCMID)")
     print("="*60)
@@ -224,9 +333,23 @@ def main():
           f"{cfg.data.batch_size * cfg.training.grad_accum_steps} effective")
     print(f"Val fold:     {cfg.data.val_fold} / {cfg.data.n_folds}")
 
+    # print metric definitions for the log so they appear automatically
+    from src.utils import metrics as _metrics_module
+    if _metrics_module.__doc__:
+        print("\nMetrics section (definitions):")
+        for line in _metrics_module.__doc__.splitlines():
+            print("   ", line)
+        print()
+
     # ── 1. Setup ──────────────────────────────────────────────────────
     set_seed(cfg.data.random_seed)
     device = get_device()
+
+    # adjust logging verbosity if debugging images
+    if cfg.data.save_preproc:
+        import logging as _logging
+        _logging.getLogger().setLevel(_logging.DEBUG)
+        _logging.debug("Debug image saving enabled; logger set to DEBUG level")
 
     # ── 2. Data pipeline ─────────────────────────────────────────────
     print("\n[Data] Building BCMID dataloaders...")
@@ -261,10 +384,17 @@ def main():
         print("\n[Train] Starting training...")
         trainer = Trainer(model, train_loader, val_loader, loss_fn, cfg, device)
         best_val_metrics = trainer.train()
+        trainer.save_history()  # save metrics to CSV for plotting
+        
+        # Generate training curves
+        history_csv = os.path.join(cfg.data.output_dir, "training_history.csv")
+        plot_training_history(history_csv, cfg.data.output_dir)
+        
         print("\n[Train] Best validation metrics:")
         print_metrics(best_val_metrics, split="VAL")
     else:
         print("\n[Train] Skipped (--skip_train flag)")
+        trainer = None
 
     # ── 6. Load best checkpoint ───────────────────────────────────────
     if os.path.exists(best_ckpt_path):
@@ -280,6 +410,12 @@ def main():
     # ── 7. Test evaluation ────────────────────────────────────────────
     print("\n[Eval] Running test set evaluation...")
     test_metrics = run_test_evaluation(model, test_loader, device, cfg, loss_fn)
+
+    # Re-plot training curves with test metrics overlaid
+    if not args.skip_train:
+        history_csv = os.path.join(cfg.data.output_dir, "training_history.csv")
+        test_metrics_path = os.path.join(cfg.data.output_dir, "test_metrics.json")
+        plot_training_history(history_csv, cfg.data.output_dir, test_metrics_path)
 
     # ── 8. Visualizations ─────────────────────────────────────────────
     if not args.no_vis:

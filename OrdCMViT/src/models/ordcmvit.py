@@ -7,7 +7,7 @@ Full architecture addressing EVERY identified flaw:
 
   FLAW → FIX:
   ├─ ViT-Base overparameterized → ViT-Small (22M), freeze all but last 3 blocks
-  ├─ Resolution too low → Mammo@384, US@224, with CLAHE preprocessing
+  ├─ Resolution too low → Mammo@384, US@384, with CLAHE preprocessing
   ├─ Patch too coarse → patch_size=16 at respective resolutions (justified)
   ├─ Two isolated CLS tokens → dedicated cross-modal fusion block + fusion CLS
   ├─ Modality collapse Case A (only US used) → auxiliary heads per modality
@@ -331,10 +331,10 @@ class OrdCMViT(nn.Module):
     Ordinal Cross-Modal Vision Transformer for BI-RADS grading.
 
     Data flow:
-      I_us [B,3,224,224] → US backbone → [B, 196+1, 384]
+      I_us [B,3,384,384] → US backbone → [B, 576+1, 384]
       I_mm [B,3,384,384] → MM backbone → [B, 576+1, 384]
                                               ↓
-                                  Spatial pool mammo: [B, 196+1, 384]
+                                  Spatial pool (no-op, both 24×24): [B, 576+1, 384]
                                               ↓
                               ┌── 3× CrossModalBlock ──┐
                               │  US tokens ↔ MM tokens  │
@@ -357,16 +357,17 @@ class OrdCMViT(nn.Module):
         self.modality_dropout_p = mc.modality_dropout_p
 
         # ── Compute token counts ──────────────────────────────────────────
-        us_grid = dc.us_size // dc.patch_size        # 224//16 = 14
+        us_grid = dc.us_size // dc.patch_size        # 384//16 = 24
         mm_grid = dc.mm_size // dc.patch_size        # 384//16 = 24
-        self.us_n_tokens = us_grid ** 2              # 196
-        self.mm_n_tokens = mm_grid ** 2              # 576
+        self.us_n_tokens = us_grid ** 2              # 576 (24×24)
+        self.mm_n_tokens = mm_grid ** 2              # 576 (24×24)
         self.us_grid = us_grid
         self.mm_grid = mm_grid
 
         print(f"[OrdCMViT] US grid: {us_grid}×{us_grid}={self.us_n_tokens} tokens")
         print(f"[OrdCMViT] MM grid: {mm_grid}×{mm_grid}={self.mm_n_tokens} tokens")
-        print(f"[OrdCMViT] Mammo pool target: {us_grid}×{us_grid}={self.us_n_tokens} tokens")
+        print(f"[OrdCMViT] Spatial pool: {mm_grid}×{mm_grid} → {us_grid}×{us_grid} "
+              f"({'no-op' if mm_grid == us_grid else 'downpool'})")
 
         # ── 1. Backbones ──────────────────────────────────────────────────
         self.us_backbone = ViTBackbone(
@@ -459,9 +460,10 @@ class OrdCMViT(nn.Module):
 
     def forward(
         self,
-        us: torch.Tensor,           # [B, 3, 224, 224]
+        us: torch.Tensor,           # [B, 3, 384, 384]
         mm: torch.Tensor,           # [B, 3, 384, 384]
         return_attn: bool = False,  # set True for CAM visualization
+        return_embeddings: bool = False,  # set True to export CLS embeddings
     ) -> Dict:
         """
         Returns dict with:
@@ -472,6 +474,10 @@ class OrdCMViT(nn.Module):
             cross_attn:     [B, N_us, N_mm]  last block cross-attention (if return_attn)
             us_cls:         [B, D]   US CLS embedding (for visualization)
             mm_cls:         [B, D]   MM CLS embedding (for visualization)
+
+            us_embeddings:   [B, D]   synonym for us_cls when return_embeddings=True
+            mm_embeddings:   [B, D]   synonym for mm_cls when return_embeddings=True
+            fused_embeddings:[B, D]   fused CLS vector when return_embeddings=True
         """
         # ── 1. Feature extraction ─────────────────────────────────────────
         us_cls, us_patches = self.us_backbone(us)   # [B,384], [B,196,384]
@@ -518,6 +524,12 @@ class OrdCMViT(nn.Module):
             "us_cls": us_cls_fused,
             "mm_cls": mm_cls_fused,
         }
+
+        # optionally export embeddings under more descriptive keys
+        if return_embeddings:
+            out["us_embeddings"] = us_cls_fused
+            out["mm_embeddings"] = mm_cls_fused
+            out["fused_embeddings"] = fused
 
         if self.use_aux_heads:
             out["aux_logits_us"] = self.aux_head_us(us_cls_orig)   # [B, 4]

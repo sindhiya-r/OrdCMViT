@@ -13,6 +13,7 @@ Training engine with:
 """
 
 import os
+import glob
 import time
 import torch
 import torch.nn as nn
@@ -290,9 +291,16 @@ class Trainer:
 
         ckpt_dir = os.path.join(cfg.data.output_dir, "checkpoints")
         log_dir  = os.path.join(cfg.data.output_dir, "logs")
+
+        # Remove stale TensorBoard event files so each fresh training run
+        # produces a single, unambiguous curve in TensorBoard.
+        for stale in glob.glob(os.path.join(log_dir, "events.out.tfevents.*")):
+            os.remove(stale)
+
         self.writer = SummaryWriter(log_dir)
         self.ckpt_dir = ckpt_dir
         self.best_metric = -1.0
+        self.history = []  # Track metrics per epoch for plotting
 
     def save_checkpoint(self, epoch: int, metrics: Dict, is_best: bool):
         state = {
@@ -314,6 +322,16 @@ class Trainer:
         for k, v in metrics.items():
             if isinstance(v, (int, float)):
                 self.writer.add_scalar(f"{split}/{k}", v, epoch)
+
+    def save_history(self):
+        """Save training history (metrics per epoch) to CSV for plotting."""
+        if not self.history:
+            return
+        import pandas as pd
+        df = pd.DataFrame(self.history)
+        csv_path = os.path.join(self.cfg.data.output_dir, "training_history.csv")
+        df.to_csv(csv_path, index=False)
+        print(f"Training history saved → {csv_path}")
 
     def train(self) -> Dict:
         tc = self.cfg.training
@@ -346,7 +364,14 @@ class Trainer:
             self.writer.add_scalar("lr/backbone",   lrs[0], epoch)
             self.writer.add_scalar("lr/new_layers", lrs[1], epoch)
 
-            # ── Monitor & checkpoint ───────────────────────────────────
+            # ── Monitor & checkpoint ──────────────────────────────────────────
+            # Store epoch metrics for plotting later
+            epoch_record = {"epoch": epoch}
+            epoch_record.update({f"train_{k}": v for k, v in train_metrics.items()})
+            epoch_record.update({f"val_{k}": v for k, v in val_metrics.items()})
+            epoch_record.update({"lr_backbone": lrs[0], "lr_new_layers": lrs[1]})
+            self.history.append(epoch_record)
+            self.save_history()  # write incrementally so CSV survives a crash
             monitor = val_metrics.get("qwk", val_metrics.get("acc", 0.0))
             is_best = monitor > self.best_metric
             if is_best:

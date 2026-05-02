@@ -109,11 +109,12 @@ def build_train_transform_mm(cfg) -> A.Compose:
 
 def build_val_transform(cfg, size: int) -> A.Compose:
     """
-    Validation/test transform: no augmentation, just normalize.
+    Validation/test transform: resize, then normalize (no augmentation).
     Note: CLAHE is applied in bcmid.py before this.
     """
     dc = cfg.data
     return A.Compose([
+        A.Resize(height=size, width=size, interpolation=1),  # INTER_LINEAR
         A.Normalize(mean=dc.normalize_mean, std=dc.normalize_std),
         ToTensorV2(),
     ])
